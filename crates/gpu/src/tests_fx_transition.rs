@@ -127,6 +127,7 @@ fn distort() {
         &[("property", e(4)), ("softness", n(3.0)), ("cutAway", n(30.0)), ("lightType", e(1)), ("lightPosition", pt(20.0, 10.0))],
     );
     effect_case("ec.distort.ccblobbylize", &[("property", e(5)), ("metal", n(30.0)), ("roughness", n(0.2))]);
+    effect_case("ec.distort.ccblobbylize", &[("property", e(6)), ("softness", n(20.0)), ("cutAway", n(25.0))]);
 }
 
 /// Effects reading another layer (gradient, reveal, backside, environment, stereo views).
