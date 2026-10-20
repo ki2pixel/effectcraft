@@ -403,6 +403,13 @@ pub struct MediaOverride {
     pub(crate) item: ItemId,
 }
 
+impl MediaOverride {
+    /// A Media Replacement of `layer`'s footage by `item`.
+    pub fn new(layer: LayerId, item: ItemId) -> Self {
+        MediaOverride { layer, item }
+    }
+}
+
 /// A collapsed precomp layer: the nested comp and the instance overrides that apply to it.
 pub struct Collapsed {
     pub item: ItemId,
