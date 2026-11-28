@@ -1738,7 +1738,7 @@ impl Frames {
                 }
             }
             // Pending replacements follow the same rule: only the newest viewer frame is urgent.
-            q.requeue.retain(|k, j| !(j.urgent && *k != key && k.comp == key.comp));
+            drop_superseded_requeues(&mut q, &mut inf, key);
             for (k, j) in &mut q.requeue {
                 j.urgent = *k == key;
                 if *k == key {
@@ -1930,7 +1930,7 @@ impl Frames {
                         Err(e) => {
                             // Not rendered (a stale revision, a lost worker): the viewer asks again.
                             log::debug!("remote frame: {e}");
-                            fw.release(key, urgent);
+                            fw.release(key, urgent, false);
                         }
                     }
                 }),
@@ -2086,7 +2086,7 @@ impl Worker {
                 // Called off (frames it read may be missing) or failed: not cached, and not
                 // "in progress" forever: the viewer asks for it again.
                 None => {
-                    self.release(job.key, job.urgent);
+                    self.release(job.key, job.urgent, false);
                     return true;
                 }
             },
@@ -2148,18 +2148,21 @@ impl Worker {
             *l = t0.elapsed().as_secs_f64() * 1000.0;
         }
         let ram = if img.is_gpu() { 0 } else { img.bytes() };
+        let mut published = false;
         if let Ok(mut c) = self.cache.lock()
             && (!img.is_gpu() || !self.gpu_retired.load(Ordering::Acquire))
         {
             c.insert_took(key, img, files, since, Some(t0.elapsed()));
+            published = true;
         }
         // (with the lock released: the accountant asks every cache for its bytes)
         effectcraft_engine::render::memory::Accountant::global().note_growth(ram);
-        self.release(key, urgent);
+        self.release(key, urgent, published);
     }
 
-    /// The job of `key` is no longer queued or running (rendered or dropped).
-    fn release(&self, key: FrameKey, urgent: bool) {
+    /// The job of `key` is no longer queued or running (rendered or dropped). `published`: the
+    /// frame was stored, so a replacement waiting for this render is satisfied by it.
+    fn release(&self, key: FrameKey, urgent: bool, published: bool) {
         let mut handled = false;
         if let Ok(mut q) = self.queue.lock() {
             q.running.remove(&key);
@@ -2168,6 +2171,11 @@ impl Worker {
             }
             if let Some(i) = q.running_cancels.iter().position(|r| r.key == key) {
                 q.running_cancels.swap_remove(i);
+            }
+            if published {
+                // The frame is cached: a replacement queued while this render read it has
+                // nothing left to render.
+                q.requeue.remove(&key);
             }
             if q.requeue.contains_key(&key) {
                 // A replacement waits for this render: the key stays in flight for it.
@@ -2485,6 +2493,20 @@ impl Default for Queue {
             fake_gpu: false,
         }
     }
+}
+
+/// Drop the urgent replacements of `key`'s comp that are for other frames (only the newest
+/// viewer frame is urgent). A dropped key leaves `inflight` unless its render still runs
+/// (`release` then removes it).
+fn drop_superseded_requeues(q: &mut Queue, inflight: &mut HashSet<FrameKey>, key: FrameKey) {
+    let running = &q.running;
+    q.requeue.retain(|k, j| {
+        let drop = j.urgent && *k != key && k.comp == key.comp;
+        if drop && !running.contains(k) {
+            inflight.remove(k);
+        }
+        !drop
+    });
 }
 
 /// Drop the pending replacements (see [`Queue::requeue`]) of the comps other than `active`.

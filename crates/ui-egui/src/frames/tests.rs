@@ -870,7 +870,7 @@ fn a_viewer_request_requeues_a_called_off_render() {
     assert!(f.urgent_pending(), "the viewer waits for the replacement");
     // The called-off render finishes: the key stays in flight for the replacement, which the
     // next viewer request starts.
-    f.worker().release(k, false);
+    f.worker().release(k, false, false);
     assert!(f.queue.lock().unwrap().requeue.contains_key(&k), "the replacement waits for the next request");
     assert!(f.inflight.lock().unwrap().contains(&k), "still in flight for the replacement");
     f.request_urgent(&src, k, a, Tick::ZERO, RenderOpts::default());
@@ -909,8 +909,73 @@ fn another_comps_viewer_frame_drops_the_called_off_replacement() {
     assert!(!f.queue.lock().unwrap().requeue.get(&k).expect("still queued").urgent, "not the viewer's frame anymore");
     f.focus_comp(Some(b));
     assert!(!f.queue.lock().unwrap().requeue.contains_key(&k), "an inactive comp's replacement is dropped");
-    f.worker().release(k, false);
+    f.worker().release(k, false, false);
     assert!(!f.inflight.lock().unwrap().contains(&k), "nothing waits for the called-off render");
+}
+
+/// #4185: an urgent frame at another time of the comp drops a replacement whose called-off
+/// render already finished; its key must leave `inflight` too, or the frame can never be asked
+/// for again.
+#[test]
+fn an_urgent_frame_forgets_a_finished_replacements_key() {
+    let mut f = Frames::default();
+    f.set_remote(Some(Arc::new(Idle)));
+    let src = idle_source();
+    let (a, b) = (ItemId(1), ItemId(2));
+    f.focus_comp(Some(a));
+    let k = FrameKey { comp: a.0, ..key(1, 5, 0) };
+    let cancel = Arc::new(AtomicBool::new(false));
+    {
+        let mut q = f.queue.lock().unwrap();
+        q.running.insert(k);
+        q.running_cancels.push(RunningCancel { key: k, cancel: cancel.clone(), urgent: false, background: true, remote: false });
+    }
+    f.inflight.lock().unwrap().insert(k);
+    f.focus_comp(Some(b));
+    f.focus_comp(Some(a));
+    f.request_urgent(&src, k, a, Tick::ZERO, RenderOpts::default());
+    assert!(f.queue.lock().unwrap().requeue.contains_key(&k));
+    // The called-off render finishes before the viewer asks for another frame.
+    f.worker().release(k, false, false);
+    assert!(f.inflight.lock().unwrap().contains(&k), "the replacement keeps the key in flight");
+    // An urgent frame at another time of the comp drops the replacement.
+    let other = FrameKey { comp: a.0, ..key(1, 7, 0) };
+    f.request_urgent(&src, other, a, Tick::ZERO, RenderOpts::default());
+    assert!(!f.queue.lock().unwrap().requeue.contains_key(&k), "the replacement is dropped");
+    assert!(!f.inflight.lock().unwrap().contains(&k), "and its key is forgotten");
+    // The viewer can ask for the frame again.
+    f.request_urgent(&src, k, a, Tick::ZERO, RenderOpts::default());
+    assert!(f.queue.lock().unwrap().jobs.iter().any(|j| j.key == k), "it renders again");
+}
+
+/// #4185: a frame stored by the render that was reading it (a disk hit still counts) satisfies
+/// the replacement the viewer asked for meanwhile: no replacement, urgent flag or in-flight key
+/// stays behind.
+#[test]
+fn a_published_frame_drops_its_replacement() {
+    let mut f = Frames::default();
+    f.set_remote(Some(Arc::new(Idle)));
+    let src = idle_source();
+    let (a, b) = (ItemId(1), ItemId(2));
+    f.focus_comp(Some(a));
+    let k = FrameKey { comp: a.0, ..key(1, 5, 0) };
+    let cancel = Arc::new(AtomicBool::new(false));
+    {
+        let mut q = f.queue.lock().unwrap();
+        q.running.insert(k);
+        q.running_cancels.push(RunningCancel { key: k, cancel: cancel.clone(), urgent: false, background: true, remote: false });
+    }
+    f.inflight.lock().unwrap().insert(k);
+    f.focus_comp(Some(b));
+    f.focus_comp(Some(a));
+    f.request_urgent(&src, k, a, Tick::ZERO, RenderOpts::default());
+    assert!(f.urgent_pending(), "the viewer waits for the replacement");
+    // The called-off render publishes the frame after all.
+    f.worker().finish_key(k, false, img(), None, None, web_time::Instant::now());
+    assert!(!f.queue.lock().unwrap().requeue.contains_key(&k), "the replacement is satisfied");
+    assert!(!f.urgent_pending());
+    assert_eq!(f.inflight(), 0, "the key is forgotten");
+    assert!(f.is_cached(&k));
 }
 
 /// #4185: starting a preview drops the other comps' frames and Cache Frames When Idle's, so the
