@@ -948,6 +948,39 @@ fn an_urgent_frame_forgets_a_finished_replacements_key() {
     assert!(f.queue.lock().unwrap().jobs.iter().any(|j| j.key == k), "it renders again");
 }
 
+/// #4185: a replacement demoted by an urgent frame elsewhere is retired when the viewer asks
+/// for another time of its comp; it would otherwise wait, and hold its key, until asked again.
+#[test]
+fn another_time_of_the_comp_retires_a_demoted_replacement() {
+    let mut f = Frames::default();
+    f.set_remote(Some(Arc::new(Idle)));
+    f.set_only_cache_active_comp(false);
+    let src = idle_source();
+    let (a, b) = (ItemId(1), ItemId(2));
+    f.focus_comp(Some(a));
+    let k = FrameKey { comp: a.0, ..key(1, 5, 0) };
+    let cancel = Arc::new(AtomicBool::new(false));
+    cancel.store(true, Ordering::Relaxed);
+    {
+        let mut q = f.queue.lock().unwrap();
+        q.running.insert(k);
+        q.running_cancels.push(RunningCancel { key: k, cancel: cancel.clone(), urgent: false, background: true, remote: false });
+    }
+    f.inflight.lock().unwrap().insert(k);
+    f.request_urgent(&src, k, a, Tick::ZERO, RenderOpts::default());
+    assert!(f.queue.lock().unwrap().requeue.get(&k).expect("a replacement").urgent);
+    // A frame of another comp demotes it...
+    f.request_urgent(&src, FrameKey { comp: b.0, ..key(1, 0, 0) }, b, Tick::ZERO, RenderOpts::default());
+    assert!(!f.queue.lock().unwrap().requeue.get(&k).expect("still queued").urgent);
+    // ...and the called-off render releases.
+    f.worker().release(k, false, false);
+    assert!(f.inflight.lock().unwrap().contains(&k));
+    // A frame at another time of the comp retires the demoted replacement.
+    f.request_urgent(&src, FrameKey { comp: a.0, ..key(1, 9, 0) }, a, Tick::ZERO, RenderOpts::default());
+    assert!(!f.queue.lock().unwrap().requeue.contains_key(&k), "the demoted replacement is retired");
+    assert!(!f.inflight.lock().unwrap().contains(&k), "and its key is forgotten");
+}
+
 /// #4185: a frame stored by the render that was reading it (a disk hit still counts) satisfies
 /// the replacement the viewer asked for meanwhile: no replacement, urgent flag or in-flight key
 /// stays behind.

@@ -2495,13 +2495,14 @@ impl Default for Queue {
     }
 }
 
-/// Drop the urgent replacements of `key`'s comp that are for other frames (only the newest
-/// viewer frame is urgent). A dropped key leaves `inflight` unless its render still runs
-/// (`release` then removes it).
+/// Drop the replacements of `key`'s comp that are for other frames: the viewer now shows this
+/// time. A demoted replacement (another comp's frame became urgent) would otherwise wait, and
+/// hold its key, until that frame is asked for again. A dropped key leaves `inflight` unless its
+/// render still runs (`release` then removes it).
 fn drop_superseded_requeues(q: &mut Queue, inflight: &mut HashSet<FrameKey>, key: FrameKey) {
     let running = &q.running;
-    q.requeue.retain(|k, j| {
-        let drop = j.urgent && *k != key && k.comp == key.comp;
+    q.requeue.retain(|k, _| {
+        let drop = *k != key && k.comp == key.comp;
         if drop && !running.contains(k) {
             inflight.remove(k);
         }
