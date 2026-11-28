@@ -1070,6 +1070,7 @@ impl Frames {
         self.closing.store(true, Ordering::SeqCst);
         if let Ok(mut q) = self.queue.lock() {
             q.jobs.clear();
+            q.requeue.clear();
             for r in &q.running_cancels {
                 r.cancel.store(true, Ordering::Relaxed);
             }
@@ -1589,6 +1590,9 @@ impl Frames {
         if q.only_cache_active_comp {
             let active = q.active_comp;
             drop_jobs(&mut q, &mut inf, |j| !j.urgent && Some(j.key.comp) != active, |r| r.background && Some(r.key.comp) != active);
+            // A replacement only starts on a request for its comp, and an inactive comp gets
+            // none: it would wait (and hold its key in flight) until the viewer comes back.
+            drop_requeues(&mut q, &mut inf, active);
         }
     }
 
@@ -1600,6 +1604,7 @@ impl Frames {
         if enabled {
             let active = q.active_comp;
             drop_jobs(&mut q, &mut inf, |j| !j.urgent && Some(j.key.comp) != active, |r| r.background && Some(r.key.comp) != active);
+            drop_requeues(&mut q, &mut inf, active);
         }
     }
 
@@ -1657,8 +1662,14 @@ impl Frames {
     /// An urgent (viewer) frame is queued or rendering.
     pub fn urgent_pending(&self) -> bool {
         // A background frame the viewer asked for while it rendered is urgent through its
-        // running record (see `request_with`), not `urgent_running`.
-        self.queue.lock().map(|q| q.urgent_running > 0 || q.jobs.iter().any(|j| j.urgent) || q.running_cancels.iter().any(|r| r.urgent)).unwrap_or(false)
+        // running record (see `request_with`), not `urgent_running`. A replacement for a
+        // called-off render waits in `requeue` until it finishes.
+        self.queue
+            .lock()
+            .map(|q| {
+                q.urgent_running > 0 || q.jobs.iter().any(|j| j.urgent) || q.requeue.values().any(|j| j.urgent) || q.running_cancels.iter().any(|r| r.urgent)
+            })
+            .unwrap_or(false)
     }
 
     fn request_with(&self, src: &RenderSource, key: FrameKey, comp: ItemId, t: Tick, opts: RenderOpts, want: Want) {
@@ -1681,9 +1692,10 @@ impl Frames {
         let Ok(mut q) = self.queue.lock() else { return };
         let Ok(mut inf) = self.inflight.lock() else { return };
         // Jobs for an older project revision can never be shown: drop them.
-        let before = q.jobs.len();
+        let before = q.jobs.len() + q.requeue.len();
         q.jobs.retain(|j| j.key.revision >= key.revision);
-        if q.jobs.len() < before {
+        q.requeue.retain(|k, _| k.revision >= key.revision);
+        if q.jobs.len() + q.requeue.len() < before {
             inf.retain(|k| k.revision >= key.revision || q.running.contains(k));
         }
         if urgent {
@@ -1713,15 +1725,61 @@ impl Frames {
             // of the same frame (a live edit) finishes, as the viewer shows it meanwhile.
             for r in &mut q.running_cancels {
                 if r.key == key {
-                    // Already rendering: keep it from being called off as background work.
-                    r.urgent = true;
-                    r.background = false;
+                    // Already rendering: keep it from being called off as background work. A
+                    // record already called off (its comp was inactive) is not reused: the
+                    // request queues a replacement once it finishes (see below). A remote
+                    // render can't be called off: its result is the frame.
+                    if r.remote || !r.cancel.load(Ordering::Relaxed) {
+                        r.urgent = true;
+                        r.background = false;
+                    }
                 } else if r.urgent && r.key.comp == key.comp && r.key.frame != key.frame {
                     r.cancel.store(true, Ordering::Relaxed);
                 }
             }
+            // Pending replacements follow the same rule: only the newest viewer frame is urgent.
+            q.requeue.retain(|k, j| !(j.urgent && *k != key && k.comp == key.comp));
+            for (k, j) in &mut q.requeue {
+                j.urgent = *k == key;
+                if *k == key {
+                    j.background = false;
+                }
+            }
         }
         if !inf.insert(key) {
+            // A running render called off because its comp was inactive can't be reused: it may
+            // have read only part of its footage. Queue a replacement for when it finishes.
+            if q.running_cancels.iter().any(|r| r.key == key && !r.remote && r.cancel.load(Ordering::Relaxed)) {
+                q.seq += 1;
+                let seq = q.seq;
+                let job = Job { key, src: src.clone(), comp, t, opts, urgent, background: want == Want::Background, seq, cancel: Arc::default() };
+                q.requeue.insert(key, job);
+                drop(inf);
+                drop(q);
+                return;
+            }
+            // The called-off render finished and left the replacement: start it now (the key
+            // stays in flight).
+            if let Some(job) = q.requeue.remove(&key) {
+                #[cfg(not(target_arch = "wasm32"))]
+                let on_lane = q.on_lane(&job);
+                q.jobs.push(job);
+                #[cfg(not(target_arch = "wasm32"))]
+                if on_lane {
+                    self.start_lanes(&mut q, 1);
+                }
+                drop(inf);
+                drop(q);
+                #[cfg(not(target_arch = "wasm32"))]
+                if !on_lane {
+                    self.start_pool();
+                }
+                #[cfg(target_arch = "wasm32")]
+                if let Some(ctx) = &self.ctx {
+                    ctx.request_repaint();
+                }
+                return;
+            }
             drop(inf);
             drop(q);
             // Queued for a lane and now the viewer's frame: it is the pool's.
@@ -1844,6 +1902,12 @@ impl Frames {
             }
             if let Ok(mut b) = self.remote_busy.lock() {
                 *b += 1;
+            }
+            // The viewer may ask for this frame while it renders: its record promotes it, and
+            // `urgent_pending` sees it (a remote render can't be called off, so the token is
+            // never read).
+            if let Ok(mut q) = self.queue.lock() {
+                q.running_cancels.push(RunningCancel { key: job.key, cancel: Arc::default(), urgent: job.urgent, background: job.background, remote: true });
             }
             started += 1;
             let (key, urgent) = (job.key, job.urgent);
@@ -2000,7 +2064,7 @@ impl Worker {
             if job.urgent {
                 q.urgent_running += 1;
             }
-            q.running_cancels.push(RunningCancel { key: job.key, cancel: job.cancel.clone(), urgent: job.urgent, background: job.background });
+            q.running_cancels.push(RunningCancel { key: job.key, cancel: job.cancel.clone(), urgent: job.urgent, background: job.background, remote: false });
             (job, slot)
         };
         let t0 = web_time::Instant::now();
@@ -2096,9 +2160,7 @@ impl Worker {
 
     /// The job of `key` is no longer queued or running (rendered or dropped).
     fn release(&self, key: FrameKey, urgent: bool) {
-        if let Ok(mut inf) = self.inflight.lock() {
-            inf.remove(&key);
-        }
+        let mut handled = false;
         if let Ok(mut q) = self.queue.lock() {
             q.running.remove(&key);
             if urgent {
@@ -2107,6 +2169,17 @@ impl Worker {
             if let Some(i) = q.running_cancels.iter().position(|r| r.key == key) {
                 q.running_cancels.swap_remove(i);
             }
+            if q.requeue.contains_key(&key) {
+                // A replacement waits for this render: the key stays in flight for it.
+                handled = true;
+            } else if let Ok(mut inf) = self.inflight.lock() {
+                inf.remove(&key);
+                handled = true;
+            }
+        }
+        if !handled && let Ok(mut inf) = self.inflight.lock() {
+            // (the queue was poisoned: still let the viewer ask again)
+            inf.remove(&key);
         }
         if let Some(ctx) = &self.ctx {
             ctx.request_repaint();
@@ -2335,10 +2408,17 @@ struct RunningCancel {
     cancel: Arc<AtomicBool>,
     urgent: bool,
     background: bool,
+    /// Rendering elsewhere ([`Frames::dispatch_remote`]): it has no cancellation of its own, so
+    /// its token only tells the queue the comp became inactive; the frame it renders is still
+    /// good.
+    remote: bool,
 }
 
 struct Queue {
     jobs: Vec<Job>,
+    /// Frames whose running render was called off, to render again once it finishes (see
+    /// [`Frames::request_urgent`]): a called-off render may have read only part of its footage.
+    requeue: HashMap<FrameKey, Job>,
     running: HashSet<FrameKey>,
     urgent_running: usize,
     /// The running jobs and how to call them off.
@@ -2386,6 +2466,7 @@ impl Default for Queue {
     fn default() -> Self {
         Queue {
             jobs: Vec::new(),
+            requeue: HashMap::new(),
             running: HashSet::new(),
             urgent_running: 0,
             running_cancels: Vec::new(),
@@ -2406,6 +2487,18 @@ impl Default for Queue {
     }
 }
 
+/// Drop the pending replacements (see [`Queue::requeue`]) of the comps other than `active`.
+fn drop_requeues(q: &mut Queue, inflight: &mut HashSet<FrameKey>, active: Option<u64>) {
+    let running = &q.running;
+    q.requeue.retain(|k, _| {
+        let drop = Some(k.comp) != active;
+        if drop && !running.contains(k) {
+            inflight.remove(k);
+        }
+        !drop
+    });
+}
+
 /// Drop the queued jobs `gone` accepts (forgetting them in flight unless they run) and call off
 /// the running jobs `cancel` accepts.
 fn drop_jobs(q: &mut Queue, inflight: &mut HashSet<FrameKey>, gone: impl Fn(&Job) -> bool, cancel: impl Fn(&RunningCancel) -> bool) {
@@ -2414,6 +2507,15 @@ fn drop_jobs(q: &mut Queue, inflight: &mut HashSet<FrameKey>, gone: impl Fn(&Job
         let drop = gone(j);
         if drop && !running.contains(&j.key) {
             inflight.remove(&j.key);
+        }
+        !drop
+    });
+    // A replacement waiting for a called-off render goes the same way (its running record is
+    // still in `running`, so `inflight` stays until it releases).
+    q.requeue.retain(|k, j| {
+        let drop = gone(j);
+        if drop && !running.contains(k) {
+            inflight.remove(k);
         }
         !drop
     });

@@ -704,7 +704,7 @@ fn switching_comps_drops_and_calls_off_the_inactive_comps_frames() {
     // One of them is already rendering.
     let cancel = Arc::new(AtomicBool::new(false));
     let running = FrameKey { comp: 1, ..key(1, 5, 0) };
-    f.queue.lock().unwrap().running_cancels.push(RunningCancel { key: running, cancel: cancel.clone(), urgent: false, background: true });
+    f.queue.lock().unwrap().running_cancels.push(RunningCancel { key: running, cancel: cancel.clone(), urgent: false, background: true, remote: false });
     f.focus_comp(Some(b));
     assert!(f.queue.lock().unwrap().jobs.is_empty(), "the inactive comp's queued frames are dropped");
     assert_eq!(f.inflight(), 0, "and forgotten in flight");
@@ -771,7 +771,7 @@ fn a_viewer_request_takes_a_background_frame_out_of_the_background() {
     {
         let mut q = f.queue.lock().unwrap();
         q.running.insert(running);
-        q.running_cancels.push(RunningCancel { key: running, cancel: cancel.clone(), urgent: false, background: true });
+        q.running_cancels.push(RunningCancel { key: running, cancel: cancel.clone(), urgent: false, background: true, remote: false });
     }
     f.inflight.lock().unwrap().insert(running);
     f.request_urgent(&src, running, ItemId(1), Tick::ZERO, RenderOpts::default());
@@ -783,6 +783,134 @@ fn a_viewer_request_takes_a_background_frame_out_of_the_background() {
     assert!(f.urgent_pending(), "the viewer waits for the promoted frame");
     f.set_playhead(Some(playhead(0, false)));
     assert!(!cancel.load(Ordering::Relaxed), "playback does not call off the frame the viewer asked for");
+}
+
+/// A remote renderer that holds the jobs it is given, so a test can finish them.
+#[derive(Default)]
+struct Holding {
+    jobs: Mutex<Vec<(RemoteJob, RemoteDone)>>,
+}
+
+impl RemoteFrames for Holding {
+    fn slots(&self) -> usize {
+        4
+    }
+
+    fn start(&self, job: RemoteJob, done: RemoteDone) {
+        self.jobs.lock().unwrap().push((job, done));
+    }
+}
+
+/// #4185: a remote background frame the viewer asks for while it renders is the viewer's frame
+/// and counts as urgent (it is not requested a second time); a remote render can't be called
+/// off, so its result is still the frame.
+#[test]
+fn a_viewer_request_promotes_a_running_remote_frame() {
+    let holding = Arc::new(Holding::default());
+    let mut f = Frames::default();
+    f.set_remote(Some(holding.clone()));
+    let src = idle_source();
+    let a = ItemId(1);
+    f.focus_comp(Some(a));
+    let k = FrameKey { comp: a.0, ..key(1, 5, 0) };
+    f.request_background(&src, k, a, Tick::ZERO, RenderOpts::default());
+    assert_eq!(f.dispatch_remote(), 1);
+    assert_eq!(f.remote_busy(), 1);
+    assert!(!f.urgent_pending());
+    f.request_urgent(&src, k, a, Tick::ZERO, RenderOpts::default());
+    assert!(f.urgent_pending(), "the viewer waits for the remote frame");
+    {
+        let q = f.queue.lock().unwrap();
+        let r = q.running_cancels.iter().find(|r| r.key == k).expect("the remote job is tracked");
+        assert!(r.urgent && !r.background, "the viewer's frame");
+        assert!(r.remote, "a remote render");
+        assert!(q.jobs.is_empty(), "no second render of the same frame");
+    }
+    assert_eq!(f.inflight(), 1);
+    // The remote render finishes: the frame is cached and the job released.
+    let (job, done) = holding.jobs.lock().unwrap().pop().expect("dispatched");
+    assert_eq!(job.comp, a);
+    done(Ok(RemoteFrame { width: 1, height: 1, rgba: vec![0, 0, 0, 255], ms: 1.0 }));
+    assert!(!f.urgent_pending());
+    assert_eq!(f.inflight(), 0);
+    assert!(f.is_cached(&k));
+}
+
+/// #4185: a background render called off when its comp became inactive can't be reused (it may
+/// have read only part of its footage). A viewer request for it queues a replacement that runs
+/// once the called-off render finishes, without a second request in flight.
+#[test]
+fn a_viewer_request_requeues_a_called_off_render() {
+    let mut f = Frames::default();
+    f.set_remote(Some(Arc::new(Idle)));
+    let src = idle_source();
+    let (a, b) = (ItemId(1), ItemId(2));
+    f.focus_comp(Some(a));
+    let k = FrameKey { comp: a.0, ..key(1, 5, 0) };
+    let cancel = Arc::new(AtomicBool::new(false));
+    {
+        let mut q = f.queue.lock().unwrap();
+        q.running.insert(k);
+        q.running_cancels.push(RunningCancel { key: k, cancel: cancel.clone(), urgent: false, background: true, remote: false });
+    }
+    f.inflight.lock().unwrap().insert(k);
+    f.focus_comp(Some(b));
+    assert!(cancel.load(Ordering::Relaxed), "the inactive comp's frame is called off");
+    // The viewer comes back and asks for it: the called-off render is not reused, a replacement
+    // waits for it.
+    f.focus_comp(Some(a));
+    f.request_urgent(&src, k, a, Tick::ZERO, RenderOpts::default());
+    {
+        let q = f.queue.lock().unwrap();
+        let r = q.running_cancels.iter().find(|r| r.key == k).expect("still rendering");
+        assert!(!r.urgent, "a called-off record is not the viewer's render");
+        let j = q.requeue.get(&k).expect("a replacement is queued");
+        assert!(j.urgent && !j.background, "the replacement is the viewer's frame");
+    }
+    assert!(f.urgent_pending(), "the viewer waits for the replacement");
+    // The called-off render finishes: the key stays in flight for the replacement, which the
+    // next viewer request starts.
+    f.worker().release(k, false);
+    assert!(f.queue.lock().unwrap().requeue.contains_key(&k), "the replacement waits for the next request");
+    assert!(f.inflight.lock().unwrap().contains(&k), "still in flight for the replacement");
+    f.request_urgent(&src, k, a, Tick::ZERO, RenderOpts::default());
+    {
+        let q = f.queue.lock().unwrap();
+        assert!(!q.requeue.contains_key(&k), "the replacement moved to the queue");
+        let j = q.jobs.iter().find(|j| j.key == k).expect("queued");
+        assert!(j.urgent, "the viewer's frame");
+    }
+    assert!(f.inflight.lock().unwrap().contains(&k), "one render for the key");
+}
+
+/// #4185: a replacement waiting for a called-off render belongs to the comp the viewer left; an
+/// urgent frame elsewhere makes it prefetch, and the next comp switch drops it.
+#[test]
+fn another_comps_viewer_frame_drops_the_called_off_replacement() {
+    let mut f = Frames::default();
+    f.set_remote(Some(Arc::new(Idle)));
+    let src = idle_source();
+    let (a, b) = (ItemId(1), ItemId(2));
+    f.focus_comp(Some(a));
+    let k = FrameKey { comp: a.0, ..key(1, 5, 0) };
+    let cancel = Arc::new(AtomicBool::new(false));
+    {
+        let mut q = f.queue.lock().unwrap();
+        q.running.insert(k);
+        q.running_cancels.push(RunningCancel { key: k, cancel: cancel.clone(), urgent: false, background: true, remote: false });
+    }
+    f.inflight.lock().unwrap().insert(k);
+    f.focus_comp(Some(b));
+    f.focus_comp(Some(a));
+    f.request_urgent(&src, k, a, Tick::ZERO, RenderOpts::default());
+    // The viewer moves to B before the called-off render finishes.
+    let other = FrameKey { comp: b.0, ..key(1, 7, 0) };
+    f.request_urgent(&src, other, b, Tick::ZERO, RenderOpts::default());
+    assert!(!f.queue.lock().unwrap().requeue.get(&k).expect("still queued").urgent, "not the viewer's frame anymore");
+    f.focus_comp(Some(b));
+    assert!(!f.queue.lock().unwrap().requeue.contains_key(&k), "an inactive comp's replacement is dropped");
+    f.worker().release(k, false);
+    assert!(!f.inflight.lock().unwrap().contains(&k), "nothing waits for the called-off render");
 }
 
 /// #4185: starting a preview drops the other comps' frames and Cache Frames When Idle's, so the
