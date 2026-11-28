@@ -3767,6 +3767,48 @@ fn trim_comp_to_work_area_moves_the_cached_frames_and_undo_finds_them() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// #3316: a trim only carries frames inside the comp it made. A frame cached outside the work
+/// area stays under the old identity, so extending the comp later doesn't show it at a frame
+/// the trim emptied.
+#[test]
+fn a_trim_does_not_carry_frames_past_its_duration() {
+    use effectcraft_engine::Session;
+    use effectcraft_engine::project::LayerId;
+    use serde_json::json;
+
+    let mut s = Session::default();
+    let cid = ItemId(s.execute("comp.new", json!({"name": "A", "width": 16, "height": 16, "duration": 4, "frameRate": 30})).unwrap()["comp"].as_u64().unwrap());
+    let l = LayerId(s.execute("layer.newSolid", json!({"color": "#ff0000", "width": 8, "height": 8})).unwrap()["layer"].as_u64().unwrap());
+    let fr = s.project.comp(cid).unwrap().frame_rate;
+    {
+        let c = Arc::make_mut(&mut s.project).comp_mut(cid).unwrap();
+        c.work_area = (fr.tick_of(30), fr.tick_of(90));
+        let l = c.layer_mut(l).unwrap();
+        (l.start_time, l.in_point, l.out_point) = (fr.tick_of(30), fr.tick_of(30), fr.tick_of(120));
+    }
+    let p0 = s.project.clone();
+    let f = Frames::default();
+    let k = |content: u64, frame: i64| FrameKey { content, comp: cid.0, ..key(0, frame, 0) };
+    let id0 = f.content_of(&p0, 1, cid);
+    for i in 30..120 {
+        insert(&f, k(id0, i));
+    }
+
+    s.execute("comp.trimToWorkArea", json!({})).unwrap();
+    let p1 = s.project.clone();
+    let id1 = f.content_of(&p1, 2, cid);
+    // (58 and 59 are the cut edge's shutter samples.)
+    assert_eq!(f.cached_frames(&k(id1, 0)), (0..58).collect::<Vec<_>>(), "only the frames inside the trimmed comp moved");
+    assert!(!f.is_cached(&k(id1, 70)), "frame 70 (old 100) is past the trimmed comp's duration");
+
+    // Extending the comp keeps the trimmed frames; the frame the trim clipped is not reused.
+    s.execute("comp.settings", json!({"duration": 4.0})).unwrap();
+    let p2 = s.project.clone();
+    let id2 = f.content_of(&p2, 3, cid);
+    assert_eq!(f.cached_frames(&k(id2, 0)), (0..58).collect::<Vec<_>>(), "the trimmed frames stay cached");
+    assert!(!f.is_cached(&k(id2, 70)), "the extended comp's frame 70 renders instead of the clipped image");
+}
+
 /// #3316: a trim keeps the frames no comp time expression or comp-time effect reads, and drops
 /// the ones they draw.
 #[test]

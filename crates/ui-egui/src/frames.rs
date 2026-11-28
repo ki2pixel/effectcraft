@@ -1254,7 +1254,11 @@ impl Frames {
                 .map(|dirty| (dirty, 0))
                 .or_else(|| project.trim_carry(base, comp, &heard).map(|c| (frames_of(project, comp, &c.dirty), c.shift)));
             if let Some((dirty, shift)) = carried {
-                cache.carry_shifted(*base_id, plain, shift, |f| !dirty.iter().any(|(lo, hi)| (*lo..=*hi).contains(&f)));
+                // A trim only keeps the frames of the comp it made: a frame moved past its
+                // duration (the work area ended before it) would be reused when the comp is
+                // extended, where it shows what the trim clipped.
+                let frames = project.comp(comp).map_or(0, |c| c.frame_rate.frame_at(c.duration));
+                cache.carry_shifted(*base_id, plain, shift, |f| f < frames && !dirty.iter().any(|(lo, hi)| (*lo..=*hi).contains(&f)));
                 #[cfg(not(target_arch = "wasm32"))]
                 if let Ok(mut q) = self.disk_carries.lock() {
                     if q.len() >= MAX_KEEPERS {
