@@ -40,6 +40,7 @@ mod reach;
 mod settings;
 
 pub use comp::{Comp, Guide, Renderer, Resolution};
+pub use dirty::TrimCarry;
 pub use footage::{
     AlphaMode, CineonSettings, CineonUnits, FieldOrder, Footage, FootageKind, PCRAFT_MAX_INPUT, Proxy, Solid, SourceLayer, VIDEO_EXTENSIONS, cineon_log_to_lin,
 };

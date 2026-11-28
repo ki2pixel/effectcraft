@@ -807,3 +807,75 @@ fn properties_the_renderer_reads_elsewhen_keep_the_whole_span() {
     );
     assert_eq!(b.keyframe_spans(&a, true, false), None);
 }
+
+/// #3316: a trim keeps the frames it only moved, and marks the frames whose comp time
+/// expressions or comp-time effects read, or that a cut layer samples across.
+#[test]
+fn a_trim_keeps_shifted_frames_and_marks_comp_time() {
+    use crate::build::{self, Ids};
+    use crate::{Expression, GroupKind, LayerSource};
+    use effectcraft_color::Label;
+
+    let fr = FrameRate::FPS_30;
+    let mut p = Project::default();
+    let comp = Comp::new(64, 36, fr, Tick::from_seconds_f64(4.0));
+    let cid = p.add_item("Main", Label::Sandstone, None, ItemKind::Comp(comp.clone().into()));
+    let solid = p.add_item("Red", Label::Red, None, ItemKind::Solid(Solid { color: [1.0, 0.0, 0.0], width: 64, height: 36, pixel_aspect: 1.0 }));
+    let mut layer = |name: &str, from: i64, to: i64| {
+        let mut l = build::layer(&mut p, &comp, name, LayerSource::Solid { item: solid }, (64, 36), None);
+        (l.start_time, l.in_point, l.out_point) = (fr.tick_of(from), fr.tick_of(from), fr.tick_of(to));
+        l
+    };
+    let plain = layer("Plain", 30, 90);
+    let expr = layer("Expr", 45, 75);
+    let timecode = layer("Timecode", 30, 45);
+    let (plain_id, expr_id, timecode_id) = (plain.id, expr.id, timecode.id);
+    {
+        let c = p.comp_mut(cid).unwrap();
+        c.layers.push(plain);
+        c.layers.push(expr);
+        c.layers.push(timecode);
+    }
+    let (a, b) = (fr.tick_of(30), fr.tick_of(90));
+    let trimmed = |p: &Project| {
+        let mut q = p.clone();
+        let c = q.comp_mut(cid).unwrap();
+        for l in c.layers.iter_mut() {
+            l.start_time -= a;
+            l.in_point = (l.in_point - a).max(Tick::ZERO);
+            l.out_point = (l.out_point - a).min(b - a);
+        }
+        c.duration = b - a;
+        c.work_area = (Tick::ZERO, b - a);
+        q
+    };
+    // Nothing in these layers reads comp time: every frame keeps drawing the same.
+    let clean = trimmed(&p);
+    let carry = clean.trim_carry(&p, cid, &p.heard_layers()).expect("the trim");
+    assert_eq!(carry.shift, 30);
+    assert!(carry.dirty.is_empty(), "{:?}", carry.dirty);
+
+    // An expression and a comp-time text effect reach the frames they draw.
+    p.comp_mut(cid).unwrap().layer_mut(expr_id).unwrap().props.prop_mut("transform/opacity").unwrap().expr =
+        Some(Expression { text: "time * 10".into(), enabled: true });
+    let mut ids = Ids(&mut p.next_id);
+    let mut g = ids.group("1", "Timecode");
+    g.kind = GroupKind::Effect { effect: "ec.text.timecode".into() };
+    p.comp_mut(cid).unwrap().layer_mut(timecode_id).unwrap().props.sub_mut("effects").unwrap().children.push(g.into());
+    let heard = p.heard_layers();
+    let q = trimmed(&p);
+    let carry = q.trim_carry(&p, cid, &heard).expect("the trim");
+    assert_eq!(carry.shift, 30);
+    let dirty = |f: i64| carry.dirty.iter().any(|(s, e)| fr.frame_at(*s) <= f && f <= fr.frame_at(*e));
+    assert!(dirty(0) && dirty(14) && dirty(15) && dirty(44), "dirty spans {:?}", carry.dirty);
+    assert!(!dirty(50) && !dirty(59), "dirty spans {:?}", carry.dirty);
+
+    // Undo: the trimmed frames move back, and the layers' time-dependent spans are in the
+    // restored comp's time.
+    let back = p.trim_carry(&q, cid, &heard).expect("the undo");
+    assert_eq!(back.shift, -30);
+    let dirty = |f: i64| back.dirty.iter().any(|(s, e)| fr.frame_at(*s) <= f && f <= fr.frame_at(*e));
+    assert!(dirty(35) && dirty(50) && dirty(70), "dirty spans {:?}", back.dirty);
+    assert!(!dirty(10), "dirty spans {:?}", back.dirty);
+    assert_eq!(plain_id, p.comp(cid).unwrap().layers[0].id);
+}

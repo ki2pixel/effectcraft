@@ -3675,3 +3675,151 @@ fn an_effect_found_by_a_short_route_is_not_hidden_by_a_deep_one() {
     nest(&mut s, root, fx);
     assert!(comp_has_effects(&s.project, root));
 }
+
+/// #3316: Trim Comp to Work Area moves the cached frames to their new frame numbers instead of
+/// dropping them, in RAM and on disk, and undo moves them back.
+#[test]
+fn trim_comp_to_work_area_moves_the_cached_frames_and_undo_finds_them() {
+    use effectcraft_engine::Session;
+    use effectcraft_engine::project::LayerId;
+    use effectcraft_engine::render::render_frame;
+    use serde_json::json;
+
+    let mut s = Session::default();
+    let cid = ItemId(s.execute("comp.new", json!({"name": "A", "width": 16, "height": 16, "duration": 4, "frameRate": 30})).unwrap()["comp"].as_u64().unwrap());
+    let l = LayerId(s.execute("layer.newSolid", json!({"color": "#ff0000", "width": 8, "height": 8})).unwrap()["layer"].as_u64().unwrap());
+    for (t, x) in [(0.0, 0.0), (4.0, 16.0)] {
+        s.execute("prop.addKey", json!({"layer": l.0, "path": "transform/position", "time": t, "value": [x, 8.0, 0.0]})).unwrap();
+    }
+    let fr = s.project.comp(cid).unwrap().frame_rate;
+    {
+        let c = Arc::make_mut(&mut s.project).comp_mut(cid).unwrap();
+        c.work_area = (fr.tick_of(30), fr.tick_of(90));
+        let l = c.layer_mut(l).unwrap();
+        (l.start_time, l.in_point, l.out_point) = (fr.tick_of(30), fr.tick_of(30), fr.tick_of(90));
+    }
+    let p0 = s.project.clone();
+    let f = Frames::default();
+    let k = |content: u64, frame: i64| FrameKey { content, comp: cid.0, ..key(0, frame, 0) };
+    let id0 = f.content_of(&p0, 1, cid);
+    for i in 30..90 {
+        insert(&f, k(id0, i));
+    }
+
+    s.execute("comp.trimToWorkArea", json!({})).unwrap();
+    let p1 = s.project.clone();
+    let id1 = f.content_of(&p1, 2, cid);
+    assert_eq!(f.cached_frames(&k(id1, 0)), (0..60).collect::<Vec<_>>(), "the trimmed frames moved");
+    for i in [0, 1, 15, 30, 59] {
+        assert!(
+            render_frame(&p0, cid, fr.tick_of(i + 30), 1.0).data == render_frame(&p1, cid, fr.tick_of(i), 1.0).data,
+            "frame {i} renders differently after the trim"
+        );
+    }
+
+    s.execute("edit.undo", json!({})).unwrap();
+    let p2 = s.project.clone();
+    let id2 = f.content_of(&p2, 3, cid);
+    assert_eq!(f.cached_frames(&k(id2, 0)), (30..90).collect::<Vec<_>>(), "the undo moved them back");
+    for i in [30, 45, 60, 89] {
+        assert!(
+            render_frame(&p1, cid, fr.tick_of(i - 30), 1.0).data == render_frame(&p2, cid, fr.tick_of(i), 1.0).data,
+            "frame {i} renders differently after the undo"
+        );
+    }
+
+    // The same frames on disk (the blue bar) move with them.
+    let dir = std::env::temp_dir().join(format!("ec-trim-carry-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let disk = DiskCache::open(&dir, 1 << 30).unwrap();
+    let opts = RenderOpts::default();
+    let oh = opts_hash(&opts);
+    let src = |p: &Arc<Project>| RenderSource {
+        project: p.clone(),
+        footage: Arc::new(effectcraft_engine::render::NoFootage),
+        expr: None,
+        layer_cache: Arc::default(),
+        gpu: None,
+        gpu_display: false,
+        disk: Some(disk.clone()),
+    };
+    let content0 = disk_cache::comp_content_key(&p0, cid);
+    for i in 30..90 {
+        disk.put_frame_now(disk_cache::frame_key(content0, i, 1000, oh), 1, 1, &[1, 2, 3, 255], &ReadFiles::default());
+    }
+    let d = Frames::default();
+    let series = |p: &Arc<Project>, rev: u64| FrameKey { revision: rev, content: d.content_of(p, rev, cid), comp: cid.0, opts: oh, ..key(0, 0, 0) };
+    let blue = |p: &Arc<Project>, rev: u64, want: &[i64]| {
+        let base = series(p, rev);
+        let mut got = vec![];
+        for _ in 0..1000 {
+            got = d.disk_frames(&src(p), &base, 0..120, &opts);
+            if got == want {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        got
+    };
+    assert_eq!(blue(&p0, 1, &(30..90).collect::<Vec<_>>()), (30..90).collect::<Vec<_>>(), "before the trim");
+    assert_eq!(blue(&p1, 2, &(0..60).collect::<Vec<_>>()), (0..60).collect::<Vec<_>>(), "after the trim");
+    assert_eq!(blue(&p2, 3, &(30..90).collect::<Vec<_>>()), (30..90).collect::<Vec<_>>(), "after the undo");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// #3316: a trim keeps the frames no comp time expression or comp-time effect reads, and drops
+/// the ones they draw.
+#[test]
+fn trim_comp_to_work_area_keeps_only_the_frames_no_comp_time_reaches() {
+    use effectcraft_engine::Session;
+    use effectcraft_engine::project::{Expression, LayerId};
+    use effectcraft_engine::render::render_frame;
+    use serde_json::json;
+
+    let mut s = Session::default();
+    let cid = ItemId(s.execute("comp.new", json!({"name": "A", "width": 32, "height": 18, "duration": 4, "frameRate": 30})).unwrap()["comp"].as_u64().unwrap());
+    let solid = |s: &mut Session, color: &str| {
+        LayerId(s.execute("layer.newSolid", json!({"color": color, "width": 16, "height": 16})).unwrap()["layer"].as_u64().unwrap())
+    };
+    let (plain, expr, timecode) = (solid(&mut s, "#ff0000"), solid(&mut s, "#00ff00"), solid(&mut s, "#0000ff"));
+    let fr = s.project.comp(cid).unwrap().frame_rate;
+    {
+        let c = Arc::make_mut(&mut s.project).comp_mut(cid).unwrap();
+        for (l, from, to) in [(plain, 75, 90), (expr, 45, 75), (timecode, 30, 45)] {
+            let l = c.layer_mut(l).unwrap();
+            (l.start_time, l.in_point, l.out_point) = (fr.tick_of(from), fr.tick_of(from), fr.tick_of(to));
+        }
+        c.work_area = (fr.tick_of(30), fr.tick_of(90));
+    }
+    Arc::make_mut(&mut s.project).comp_mut(cid).unwrap().layer_mut(expr).unwrap().props.prop_mut("transform/opacity").unwrap().expr =
+        Some(Expression { text: "time * 10".into(), enabled: true });
+    // The timecode text showing the comp's time (not the layer's).
+    s.execute("effect.apply", json!({"layers": [timecode.0], "effect": "Timecode"})).unwrap();
+    s.execute("prop.set", json!({"layer": timecode.0, "path": "effects/#1/timeSource", "value": 1})).unwrap();
+    s.execute("prop.set", json!({"layer": timecode.0, "path": "effects/#1/textSize", "value": 8})).unwrap();
+    s.execute("prop.set", json!({"layer": timecode.0, "path": "effects/#1/textPosition", "value": [0.5, 0.5]})).unwrap();
+    let p0 = s.project.clone();
+    let f = Frames::default();
+    let k = |content: u64, frame: i64| FrameKey { content, comp: cid.0, ..key(0, frame, 0) };
+    let id0 = f.content_of(&p0, 1, cid);
+    for i in 30..90 {
+        insert(&f, k(id0, i));
+    }
+
+    s.execute("comp.trimToWorkArea", json!({})).unwrap();
+    let p1 = s.project.clone();
+    let id1 = f.content_of(&p1, 2, cid);
+    let kept = f.cached_frames(&k(id1, 0));
+    assert!(kept.iter().all(|i| *i >= 45) && kept.contains(&50) && kept.contains(&59), "{kept:?}");
+    for i in kept {
+        assert!(
+            render_frame(&p0, cid, fr.tick_of(i + 30), 1.0).data == render_frame(&p1, cid, fr.tick_of(i), 1.0).data,
+            "kept frame {i} renders differently after the trim"
+        );
+    }
+    // (the frames the trim's comp time reaches do draw differently: the test means something)
+    assert!(
+        (0..45).any(|i| render_frame(&p0, cid, fr.tick_of(i + 30), 1.0).data != render_frame(&p1, cid, fr.tick_of(i), 1.0).data),
+        "the time-dependent frames should change"
+    );
+}

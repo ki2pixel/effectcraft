@@ -444,10 +444,15 @@ impl Cache {
         self.order.retain(|k| !gone.contains(&k.content));
     }
     /// Move the frames of identity `from` that `keep` accepts to identity `to` (in place in the
-    /// eviction order), unless `to` already has them.
-    fn carry(&mut self, from: u64, to: u64, keep: impl Fn(i64) -> bool) {
-        for k in self.order.iter_mut().filter(|k| k.content == from && keep(k.frame)) {
-            let moved = FrameKey { content: to, ..*k };
+    /// eviction order), unless `to` already has them. A frame `f` moves to `f - shift` (a trim
+    /// shifts the comp's frames); frames before 0 are dropped.
+    fn carry_shifted(&mut self, from: u64, to: u64, shift: i64, keep: impl Fn(i64) -> bool) {
+        for k in self.order.iter_mut().filter(|k| k.content == from) {
+            let Some(frame) = k.frame.checked_sub(shift) else { continue };
+            if frame < 0 || !keep(frame) {
+                continue;
+            }
+            let moved = FrameKey { content: to, frame, ..*k };
             if !self.map.contains_key(&moved)
                 && let Some(img) = self.map.remove(k)
             {
@@ -565,8 +570,15 @@ pub fn comp_content(project: &Project, comp: ItemId) -> u64 {
 /// Frame ranges (inclusive) of `comp` in `new` that may draw differently than in `old`
 /// ([`Project::dirty_spans`]), a frame wider either side for rounding.
 fn dirty_frames(old: &Project, new: &Project, comp: ItemId, heard: &Heard, outside: bool) -> Option<Vec<(i64, i64)>> {
-    let fr = new.comp(comp)?.frame_rate;
-    Some(new.dirty_spans(old, comp, heard, outside)?.into_iter().map(|(s, e)| (fr.frame_at(s).saturating_sub(1), fr.frame_at(e).saturating_add(1))).collect())
+    let spans = new.dirty_spans(old, comp, heard, outside)?;
+    Some(frames_of(new, comp, &spans))
+}
+
+/// The frames of `comp` in `project` that `spans` (comp time) reach, a frame wider either side
+/// for rounding.
+fn frames_of(project: &Project, comp: ItemId, spans: &[(Tick, Tick)]) -> Vec<(i64, i64)> {
+    let Some(fr) = project.comp(comp).map(|c| c.frame_rate) else { return vec![] };
+    spans.iter().map(|(s, e)| (fr.frame_at(*s).saturating_sub(1), fr.frame_at(*e).saturating_add(1))).collect()
 }
 
 /// [`comp_content`] with each comp's version selected for both its sources and its address.
@@ -797,13 +809,15 @@ pub struct Frames {
 }
 
 /// An edit's kept frames, to find on disk under the comp's new content key: those of `comp` in
-/// `from` outside `dirty` (inclusive frame ranges) also draw `to`'s.
+/// `from` outside `dirty` (inclusive frame ranges) also draw `to`'s, frame `f` of `to` being
+/// frame `f + shift` of `from`.
 #[cfg(not(target_arch = "wasm32"))]
 struct DiskCarry {
     comp: u64,
     from: Arc<Project>,
     to: Arc<Project>,
     dirty: Vec<(i64, i64)>,
+    shift: i64,
 }
 
 /// Disk series remembered per comp (see [`Frames::disk_series`]).
@@ -1232,16 +1246,22 @@ impl Frames {
         };
         if let Some((base_id, base)) = bases.get(&comp.0)
             && comp_content_with(project, comp, base, base_comps, false) == comp_content_with(base, comp, base, |_, c| c, false)
-            && let Some(dirty) = dirty_frames(base, project, comp, &heard, comp_content_with(project, comp, base, base_tree, true) != *base_id)
             && let Ok(mut cache) = self.cache.lock()
         {
-            cache.carry(*base_id, plain, |f| !dirty.iter().any(|(lo, hi)| (*lo..=*hi).contains(&f)));
-            #[cfg(not(target_arch = "wasm32"))]
-            if let Ok(mut q) = self.disk_carries.lock() {
-                if q.len() >= MAX_KEEPERS {
-                    q.pop_front();
+            let outside = comp_content_with(project, comp, base, base_tree, true) != *base_id;
+            // An edit keeps the frames it can't reach; a trim keeps the ones it only moved.
+            let carried = dirty_frames(base, project, comp, &heard, outside)
+                .map(|dirty| (dirty, 0))
+                .or_else(|| project.trim_carry(base, comp, &heard).map(|c| (frames_of(project, comp, &c.dirty), c.shift)));
+            if let Some((dirty, shift)) = carried {
+                cache.carry_shifted(*base_id, plain, shift, |f| !dirty.iter().any(|(lo, hi)| (*lo..=*hi).contains(&f)));
+                #[cfg(not(target_arch = "wasm32"))]
+                if let Ok(mut q) = self.disk_carries.lock() {
+                    if q.len() >= MAX_KEEPERS {
+                        q.pop_front();
+                    }
+                    q.push_back(DiskCarry { comp: comp.0, from: base.clone(), to: project.clone(), dirty, shift });
                 }
-                q.push_back(DiskCarry { comp: comp.0, from: base.clone(), to: project.clone(), dirty });
             }
         }
         if bases.len() > MAX_KEEPERS {
@@ -1441,8 +1461,9 @@ impl Frames {
                         }
                         let mut linked = false;
                         for f in (0..n).filter(|f| !c.dirty.iter().any(|(lo, hi)| (*lo..=*hi).contains(f))) {
+                            let Some(from) = f.checked_add(c.shift).filter(|f| *f >= 0) else { continue };
                             for (scale, view) in &series {
-                                linked |= dc.link_frame(disk_cache::frame_key(a, f, *scale, *view), disk_cache::frame_key(b, f, *scale, *view));
+                                linked |= dc.link_frame(disk_cache::frame_key(a, from, *scale, *view), disk_cache::frame_key(b, f, *scale, *view));
                             }
                         }
                         linked

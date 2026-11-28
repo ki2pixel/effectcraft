@@ -313,6 +313,14 @@ impl Comp {
             && self.layers.iter().zip(&o.layers).all(|(a, b)| a.same_pixels_with(b, with_markers, heard(a.id)))
     }
 
+    /// [`Self::same_settings`] but for the duration a trim changes (the work area draws nothing):
+    /// every other setting must match.
+    pub(crate) fn same_trim_settings(&self, o: &Comp) -> bool {
+        let mut c = self.clone();
+        c.duration = o.duration;
+        c.same_settings(o, true)
+    }
+
     /// [`Self::same_pixels_with`] but for the layers.
     fn same_settings(&self, o: &Comp, with_markers: bool) -> bool {
         // Every field (no `..`: a new field must be considered here).
